@@ -1,63 +1,42 @@
+"""
+PostgreSQL Database Config:
+
+    queries/audit_trigger.sql
+"""
+
 from utils import *
 from config import *
-import eventlet
-from eventlet.hubs import trampoline
 
 # https://www.psycopg.org/articles/2010/12/01/postgresql-notifications-psycopg2-eventlet/?utm_source=twitterfeed&utm_medium=twitter
 
 
-def dblisten(channel, q):
+class LastEntryFetcher(NotifyHandler):
+    """Custom handler which fetches las entry in a PostgreSQL audit table on receipt of a NOTIFY."""
 
-    # Initialize connection database connection
-    database = Database(Config())
-    # Connect to database
-    database.open_connection()
+    def __init__(self, connection, audit_table):
 
-    # Subscribe to notification channel
-    database.listen_on_channel(channel)
+        super().__init__(connection)
+        self.audit_table = audit_table
 
-    conn = database.conn
-    while True:
+    def on_notify(self):
+        """Echo back entry that triggered the notify"""
 
-        trampoline(conn, read=True)  # this will spawn a green thread and return control once there is a notification
+        SQL = sql.SQL("SELECT * FROM {};").format(sql.Identifier(self.audit_table))
+        last_entry = self.connection.select_rows(SQL, fetch_method=0)
+        logger.debug(f"(Last entry in table: {last_entry})")
 
-        conn.poll()  # once there is, poll
-        while conn.notifies:
-
-            notify = conn.notifies.pop()
-            q.put(notify)  # blocks until slot available in queue to insert Notify
+        return 1
 
 
 if __name__ == "__main__":
 
     # Initialize database connection, which we will use to handle transactions with the NOTIFY results
     database = Database(Config())
-    # Connect to database
-    database.open_connection()
-    # Listen for triggers on this database channel
-    channel_name = 'table_changed'
 
-    try:
+    with database.connect() as database_connection:
 
-        q = eventlet.Queue()  # multi-producer, multi-consumer queue that works across greenlets
-        eventlet.spawn(dblisten, channel_name, q)  # spawn async greenthread in parallel
+        # Create your custom handler: must have a .on_notify(Database) method implemented.
+        handler = LastEntryFetcher(database_connection, audit_table='data_container_last')
+        dumbo = Listener(database_connection, 'table_changed', handler)
 
-        while True:
-            logger.debug(f"Waiting for a notification...")
-            notify = q.get()  # blocks until item available in queue
-            logger.success(f"Got NOTIFY: {notify.pid} {notify.channel} {notify.payload}")
-
-            # do something once received the NOTIFY (n)
-
-            SQL = 'SELECT * FROM data_container_last;'
-            last_entry = database.select_rows(SQL)
-            logger.info(f"Last entry in table: {last_entry}")
-
-            q.task_done()  # tell queue that this consumer has finished the task for which it asked q.get()
-
-    except KeyboardInterrupt:
-        logger.error("Streamer has been stopped via Keyboard Interrupt.")
-
-    finally:
-        # conn.close()
-        logger.success("Connection closed successfully")
+        dumbo.run()

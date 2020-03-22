@@ -1,36 +1,28 @@
 from utils import *
 from config import *
 
-import numpy as np
-import pandas as pd
-
 if __name__ == "__main__":
 
     # Initialize connection database connection
     database = Database(Config())
-    # Connect to database
-    database.open_connection()
 
-    # Pull data from database
-    SQL_SELECT_FROM_TABLE = "SELECT * FROM servo_data LIMIT 50"
-    
-    results = database.select_rows(SQL_SELECT_FROM_TABLE)  # returns list of psycopg2 dicts
+    with database.connect() as database_connection:
 
-    # Make pandas dataframe out of SQL query results
-    columns = [k for k in results[0].keys()]
-    df = pd.DataFrame(results, columns=columns)
-    logger.debug(f"Data fetched:\n{df.head()}")
+        # Pull data from database
+        SQL_SELECT_FROM_TABLE = "SELECT * FROM data_container LIMIT 50"
+        results = database_connection.select_rows(SQL_SELECT_FROM_TABLE)
 
-    # -- PROCESS DATA
-    df = df.sort_values(by=['unix timestamp'])
-    df = df[['unix timestamp', 'excitation freq']]
+        # Convert results to a pandas DataFrame
+        df = convert_to_df(results)
 
-    # Save results to PostgreSQL
-    WRITE_BACK = True
-    if WRITE_BACK:
+        # -- PROCESS DATA
+        df = df.sort_values(by=['id'])
+        df = df[['id']] + 5
+        logger.info(f"Data processing results {df.head()}")
 
-        # Initialize the table to hold processed data
-        database.copy_df(df, 'fiddled_data', replace=True)
+        # Save results to PostgreSQL new table
+        #WRITE_BACK = True
+        #if WRITE_BACK:
 
-    # Close connection
-    database.close()
+            # COPY DataFrame to PostgreSQL table
+            # database_connection.copy_df(df, 'fiddled_data', replace=True)

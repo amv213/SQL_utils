@@ -6,3 +6,4 @@ pygtail
 pandas
 numpy
 sqlalchemy
+eventlet

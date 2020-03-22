@@ -1,15 +1,19 @@
+import eventlet
 import io
-import sys
-from loguru import logger
-
 import psycopg2
-from psycopg2 import sql
-from psycopg2.extras import DictCursor
-
-from watchdog.events import PatternMatchingEventHandler
+import sys
 
 import pandas as pd
+
+from contextlib import contextmanager
+from eventlet.hubs import trampoline
+from loguru import logger
+from psycopg2 import sql
+from psycopg2.extras import DictCursor
+from pygtail import Pygtail
 from sqlalchemy import create_engine
+from watchdog.events import PatternMatchingEventHandler
+from watchdog.observers.polling import PollingObserver
 
 
 class Database:
@@ -39,16 +43,8 @@ class Database:
                                              port=self.port,
                                              dbname=self.dbname)
 
-                # Print PostgreSQL version
-                with self.conn.cursor() as cur:
-                    cur.execute("SELECT version();")
-                    record = cur.fetchone()
-                    logger.info(f"You are connected to - {record}")
-                    self.conn.commit()
-                    cur.close()
-
             except psycopg2.DatabaseError as error:
-                logger.error(f"Error while connecting to PostgreSQL: {error}")
+                logger.error(f"Error while connecting to PostgreSQL:\t{error}")
                 sys.exit()
 
             finally:
@@ -58,47 +54,149 @@ class Database:
         """Terminate a connection to PostgreSQL database"""
 
         if self.conn:
-
             self.conn.close()
             logger.success("Connection closed successfully.")
 
-    def create_table(self, query):
+    @contextmanager
+    def connect(self):
+        """Context manager for a single connection to the PostgreSQL database. Can then instantiate database connections
+        as:
+
+            with database.connect() as database_connection:
+                ...
+                database_connection.send()
+                ...
+
+        """
+        try:
+            self.open_connection()
+            self.connection_info()
+
+            yield self
+
+        finally:
+            self.close()
+
+    def send(self, query, args, success_msg='Query Success', error_msg="Query Error", cur_method=0, file=None,
+             fetch_method=2):
+        """Send a generic SQL query to the Database.
+
+        Args:
+            query (string or Composed): SQL command string (can be template with %s fields), as required by psycopg2
+            args (tuple or None):       tuple of args to substitute in SQL query template, as required by psycopg2
+            success_msg (string):       message to log on successful execution of the SQL query
+            error_msg (string):         message to log if error raised during execution of the SQL query
+            cur_method (int):           code to select which psycopg2 cursor execution method to use for the SQL query:
+                                        0:  cursor.execute()
+                                        1:  cursor.copy_expert()
+            file (file):                if cur_method == 1: a file-like object to read or write (according to sql).
+            fetch_method (int):         code to select which psycopg2 result retrieval method to use (fetch*()):
+                                        0: cur.fetchone()
+                                        2: cur.fetchall()
+
+        Returns:
+            records (psycopg2.extras.DictRow): list of query results (if any). Can be accessed as dictionaries.
+        """
+
+        # Open connection (if not already open)
+        self.open_connection()
+
+        try:
+
+            with self.conn.cursor(cursor_factory=DictCursor) as cur:
+                query = cur.mogrify(query, args) if args is not None else cur.mogrify(query)
+
+                # Execute query
+                if cur_method == 0:
+                    cur.execute(query)
+                elif cur_method == 1:
+                    cur.copy_expert(sql=query, file=file)
+
+                # Fetch query results
+                try:
+                    if fetch_method == 0:
+                        records = cur.fetchone()
+                    elif fetch_method == 2:
+                        records = cur.fetchall()
+                # Handle SQL queries that don't return any results
+                except psycopg2.ProgrammingError:
+                    records = []
+                    pass
+
+                self.conn.commit()
+
+                # Display success message
+                if cur.rowcount >= 0:
+                    success_msg += f": {cur.rowcount} rows affected."
+                logger.success(success_msg)
+
+                return records  # dictionaries
+
+        except (Exception, psycopg2.Error, psycopg2.DatabaseError) as e:
+            self.conn.rollback()
+            logger.error(error_msg + f":{e}. Transaction rolled-back.")
+
+    def select_rows(self, query, args=None, fetch_method=2):
+        """Send a select SQL query to the Database. Expects returns."""
+
+        success_msg = "Data fetched successfully from PostgreSQL"
+        error_msg = "Error while fetching data from PostgreSQL"
+        records = self.send(query, args, success_msg, error_msg, fetch_method=fetch_method)
+        return records
+
+    def update_rows(self, query, args=None):
+        """Run a SQL query to update rows in table."""
+
+        success_msg = "Database updated successfully"
+        error_msg = "Error while updating data in PostgreSQL"
+        self.send(query, args, success_msg, error_msg)
+
+    def insert_rows(self, query, args=None):
+        """Run a SQL query to insert rows in table."""
+
+        success_msg = "Record inserted successfully into database"
+        error_msg = "Error executing SQL query"
+        self.send(query, args, success_msg, error_msg)
+
+    def listen_on_channel(self, channel):
+        """Run a LISTEN SQL query"""
+
+        query = "LISTEN " + channel + ";"
+        success_msg = f"Successfully listening on channel {channel} for NOTIFYs"
+        error_msg = "Error executing SQL LISTEN query"
+        self.send(query, None, success_msg, error_msg)
+
+    def connection_info(self):
+        """Run a SELECT version() SQL query"""
+
+        query = "SELECT version();"
+        success_msg = f"PostgreSQL version fetched successfully"
+        error_msg = "Error while fetching PostgreSQL version"
+        record = self.send(query, None, success_msg, error_msg, fetch_method=0)  # fetchone()
+
+        logger.info(f"You are connected to - {record}")
+
+    def create_table(self, query, args=None):
         """Run a SQL query to create a table."""
 
-        self.open_connection()
+        success_msg = "Table created successfully in PostgreSQL"
+        error_msg = "Error while creating PostgreSQL table"
+        self.send(query, args, success_msg, error_msg)
 
-        try:
-
-            with self.conn.cursor() as cur:
-                query = cur.mogrify(query)
-                cur.execute(query)
-                self.conn.commit()
-                cur.close()
-
-            logger.success("Table created successfully in PostgreSQL")
-
-        except (Exception, psycopg2.DatabaseError) as error:
-            logger.error(f"Error while creating PostgreSQL table: {error}")
-
-    def copy_table(self, query, file, db_table, replace=True):
+    def copy_table(self, query, file, replace=True, db_table=None):
         """Run a SQL query to copy a table to/from file."""
 
-        self.open_connection()
+        # Replace the table already existing in the database
+        if replace:
+            query_tmp = sql.SQL("TRUNCATE {};").format(sql.Identifier(db_table))
+            success_msg = "Table truncated successfully in PostgreSQL database"
+            error_msg = "Error while truncating PostgreSQL table"
+            self.send(query_tmp, None, success_msg, error_msg)
 
-        try:
-
-            with self.conn.cursor() as cur:
-                if replace:
-                    cur.execute(sql.SQL("TRUNCATE {};").format(sql.Identifier(db_table)))
-                query = cur.mogrify(query)
-                cur.copy_expert(sql=query, file=file)
-                self.conn.commit()
-                cur.close()
-
-            logger.success("Table copied successfully to/from PostgreSQL")
-
-        except (Exception, psycopg2.DatabaseError) as error:
-            logger.error(f"Error while copying PostgreSQL table: {error}")
+        # Copy the table from file
+        success_msg = "Table copied successfully to/from PostgreSQL"
+        error_msg = "Error while copying PostgreSQL table"
+        self.send(query, None, success_msg, error_msg, cur_method=1, file=file)
 
     def copy_df(self, df, db_table, replace=True):
         """Run a SQL query to copy efficiently copy a pandas dataframe to a database table
@@ -107,14 +205,11 @@ class Database:
             https://stackoverflow.com/questions/23103962/how-to-write-dataframe-to-postgres-table
         """
 
-        # Create headless csv from pandas dataframe
-        copy_from = io.StringIO()
-        df.to_csv(copy_from, sep='\t', header=False, index=False)
-        copy_from.seek(0)
-
-        self.open_connection()
-
         try:
+            # Create headless csv from pandas dataframe
+            io_file = io.StringIO()
+            df.to_csv(io_file, sep='\t', header=False, index=False)
+            io_file.seek(0)
 
             # Quickly create a table with correct number of columns / data types
             replacement_method = 'replace' if replace else 'append'
@@ -122,118 +217,33 @@ class Database:
             df.head(0).to_sql(db_table, engine, if_exists=replacement_method, index=False)
 
             # But then exploit postgreSQL COPY command instead of slow pandas .to_sql()
-            SQL_COPY_EXPERT = sql.SQL("COPY {} FROM STDIN WITH CSV DELIMITER '\t'").format(
-                sql.Identifier(db_table))
-            self.copy_table(SQL_COPY_EXPERT, copy_from, db_table, replace=False)  # False or we are going to replace ^
+            sql_copy_expert = sql.SQL("COPY {} FROM STDIN WITH CSV DELIMITER '\t'").format(sql.Identifier(db_table))
+            self.copy_table(sql_copy_expert, file=io_file, replace=False)  # need to keep the (header-only) table
+
+            logger.success(f"DataFrame copied successfully to PostgreSQL table.")
 
         except (Exception, psycopg2.DatabaseError) as error:
             logger.error(f"Error while copying DataFrame to PostgreSQL table: {error}")
 
-    def select_rows(self, query):
-        """Run a SQL query to select rows from table."""
 
-        self.open_connection()
+def convert_to_df(query_results):
+    """Make pandas dataframe out of SQL query results"""
 
-        try:
+    columns = [k for k in query_results[0].keys()]
+    df = pd.DataFrame(query_results, columns=columns)
+    logger.debug(f"Successful conversion to DataFrame:\n{df.head()}")
 
-            with self.conn.cursor(cursor_factory=DictCursor) as cur:
-                query = cur.mogrify(query)
-                cur.execute(query)
-                records = cur.fetchall()  # dictionaries
-                self.conn.commit()
-                cur.close()
-
-            logger.success(f"Data fetched successfully from PostgreSQL:\t{cur.rowcount} rows fetched.")
-            return records
-
-        except (Exception, psycopg2.Error) as error:
-            logger.error(f"Error while fetching data from PostgreSQL: {error}")
-
-    def update_rows(self, query):
-        """Run a SQL query to update rows in table."""
-
-        self.open_connection()
-
-        try:
-
-            with self.conn.cursor() as cur:
-                query = cur.mogrify(query)
-                cur.execute(query)
-                logger.success(f"Database updated successfully:\t{cur.rowcount} rows affected.")
-                self.conn.commit()
-                cur.close()
-
-        except (Exception, psycopg2.Error) as error:
-            logger.error(f"Error while updating data in PostgreSQL: {error}")
-
-    def insert_rows(self, query, args=None):
-        """Run a SQL query to insert rows in table.
-
-        Args:
-            query (string): SQL command string (can be template with %s fields), as required by psycopg2
-            args (tuple):   tuple of args to substitute in SQL query template, as required by psycopg2
-        """
-
-        self.open_connection()
-
-        try:
-
-            with self.conn.cursor() as cur:
-                query = cur.mogrify(query, args) if args is not None else cur.mogrify(query)
-                cur.execute(query)
-                logger.success(f"Record inserted successfully into database:\t{cur.rowcount} rows inserted.")
-                self.conn.commit()
-                cur.close()
-
-        except (Exception, psycopg2.Error) as error:
-            logger.error(f"Error executing SQL query: {error}")
-
-    def execute_generic(self, query, args=None):
-        """Run a generic SQL query"""
-
-        self.open_connection()
-
-        try:
-
-            with self.conn.cursor() as cur:
-                query = cur.mogrify(query, args) if args is not None else cur.mogrify(query)
-                cur.execute(query)
-                logger.success(f"SQL query successfully sent to database.")
-                self.conn.commit()
-                cur.close()
-
-        except (Exception, psycopg2.Error) as error:
-            logger.error(f"Error executing SQL query: {error}")
-
-    def listen_on_channel(self, channel):
-        """Run a LISTEN SQL query"""
-
-        self.open_connection()
-
-        try:
-
-            query = "LISTEN " + channel + ";"
-
-            with self.conn.cursor() as cur:
-                query = cur.mogrify(query)
-                cur.execute(query)
-                logger.success(f"Successfully listening on channel {channel} for NOTIFYs.")
-                self.conn.commit()
-                cur.close()
-
-        except (Exception, psycopg2.Error) as error:
-            logger.error(f"Error executing SQL LISTEN query: {error}")
-
+    return df
 
 
 class InsertToSQL(PatternMatchingEventHandler):
 
-    def __init__(self, patterns=None, ignore_patterns=None, ignore_directories=True, case_sensitive=True):
+    def __init__(self, connection, query, patterns=None, ignore_patterns=None, ignore_directories=True, case_sensitive=True):
 
         super().__init__(patterns, ignore_patterns, ignore_directories, case_sensitive)
 
-        self.triggered = False
-        self.triggering_event = None
+        self.connection = connection
+        self.query = query
 
     # The following event_type exist:
     # 'moved', 'deleted', 'created', 'modified'
@@ -245,6 +255,124 @@ class InsertToSQL(PatternMatchingEventHandler):
         # And decide to only watch for file changes
         if not event.is_directory:
 
-            # Interface with outer world
-            self.triggering_event = event
-            self.triggered = True
+            # Process event (i.e send SQL)
+            self.process_event(event)
+
+    def process_event(self, event):
+        """Function handling what happens to an event raised by the watchdog: here we write any file changes as new entries
+        in a database table.
+
+        Args:
+            event:                  watchdog event
+            database (Database):    Database object containing the table we want to inject to
+            query (string):         SQL query psycopg2 template whose %s will be filled by new file contents
+        """
+
+        logger.debug(f"Event detected: {event.event_type} {event.src_path}")
+
+        # Use Pygtail to return unread (i.e.) new lines in modified file
+        for line in Pygtail(event.src_path):
+            # print(f"\t{line}")
+            self.connection.insert_rows(self.query, (line, ))  # remember tuple formatting (see psycopg2 docs)
+
+
+class FileWatcher:
+
+    def __init__(self, connection, query, src_path, patterns=None, ignore_directories=False, recursive=True, timeout=1):
+
+        if patterns is None:
+            patterns = ["*.txt"]
+
+        self.src_path = src_path
+        self.recursive = recursive
+        self.event_observer = PollingObserver(timeout=timeout)
+        self.event_handler = InsertToSQL(connection, query, patterns=patterns, ignore_directories=ignore_directories)
+
+    def bark(self):
+
+        self.start()
+
+        try:
+            while True:
+
+                # Main Loop.
+                # Watchdog is polling every TIMEOUT seconds
+
+                pass
+
+        except KeyboardInterrupt:
+            self.stop()
+
+    def start(self):
+        # Schedule observer
+        self.event_observer.schedule(self.event_handler, self.src_path, recursive=self.recursive)
+        # Start watchdog thread; can give it name with observer.set_name()
+        self.event_observer.start()
+
+    def stop(self):
+        self.event_observer.stop()
+        self.event_observer.join()
+
+
+class NotifyHandler:
+    """Handler managing actions performed on reception of a NOTIFY from the database"""
+
+    def __init__(self, connection):
+
+        self.connection = connection
+
+    def on_notify(self):
+        """Procedure to execute once a NOTIFY is received. Overwrite as needed"""
+        logger.debug(f"No actions taken on reception of NOTIFY.")
+        return 1
+
+
+class Listener:
+
+    def __init__(self, connection, channel, handler):
+
+        self.connection = connection
+        self.channel = channel
+        self.handler = handler
+
+    def subscribe(self, q):
+        """Green thread process waiting for NOTIFYs on the channel and feeding them to the queue"""
+
+        # Subscribe to notification channel
+        self.connection.listen_on_channel(self.channel)
+
+        conn = self.connection.conn
+        while True:
+
+            trampoline(conn, read=True)  # spawns a green thread and return control once there is a notification to read
+
+            conn.poll()  # once there is a notification --> poll
+
+            while conn.notifies:
+                notify = conn.notifies.pop()  # extract notify
+                q.put(notify)  # blocks until slot available in queue to insert Notify
+                # -------------%------------------%--------------------%-------------------#
+
+    def run(self):
+
+        queue = eventlet.Queue()  # multi-producer, multi-consumer queue that works across greenlets
+        g = eventlet.spawn(self.subscribe, queue)  # spawn async greenthread in parallel
+
+        while True:
+
+            try:
+
+                logger.debug(f"Waiting for a notification...")
+                notify = queue.get()  # blocks until item available in queue
+                # -------------%------------------%--------------------%-------------------#
+                logger.success(f"Got NOTIFY: {notify.pid} {notify.channel} {notify.payload}")
+
+                # do something once received the NOTIFY (n)
+                self.handler.on_notify()
+
+                queue.task_done()  # tell queue that this consumer has finished the task for which it asked q.get()
+
+            except (Exception, KeyboardInterrupt):
+                eventlet.kill(g)
+                logger.error("Listener has been killed via Keyboard Interrupt. Greenthread garbage collected.")
+                break
