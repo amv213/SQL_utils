@@ -6,23 +6,27 @@ if __name__ == "__main__":
     # Initialize connection database connection
     database = Database(Config())
 
-    with database.connect() as database_connection:
+    # Create a connection pool. Context manager ensures pool is closed at the end.
+    with database.open(minconns=1) as pool:
 
-        # Pull data from database
-        SQL_SELECT_FROM_TABLE = "SELECT * FROM data_container LIMIT 50"
-        results = database_connection.select_rows(SQL_SELECT_FROM_TABLE)
+        # Get individual connections from the pool. Context manager ensures connection [key] is returned to the pool.
+        with pool.connect(key=1):
 
-        # Convert results to a pandas DataFrame
-        df = convert_to_df(results)
+            # Pull data from database
+            SQL_SELECT_FROM_TABLE = "SELECT * FROM data_container"
+            results = pool.select_rows(SQL_SELECT_FROM_TABLE, key=1)
 
-        # -- PROCESS DATA
-        df = df.sort_values(by=['id'])
-        df = df[['id']] + 5
-        logger.info(f"Data processing results {df.head()}")
+            # Convert results to a pandas DataFrame
+            df = convert_to_df(results)
 
-        # Save results to PostgreSQL new table
-        #WRITE_BACK = True
-        #if WRITE_BACK:
+            # -- PROCESS DATA
+            df = df.sort_values(by=['id'])
+            df = df[['id']] + 5
+            logger.info(f"Data processing results:\n{df.head()}")
 
-            # COPY DataFrame to PostgreSQL table
-            # database_connection.copy_df(df, 'fiddled_data', replace=True)
+            # Save results to PostgreSQL new table
+            WRITE_BACK = False
+            if WRITE_BACK:
+
+                # COPY DataFrame to PostgreSQL table
+                pool.copy_df(df, 'fiddled_data', replace=True, key=1)

@@ -13,16 +13,19 @@ from config import *
 class LastEntryFetcher(NotifyHandler):
     """Custom handler which fetches las entry in a PostgreSQL audit table on receipt of a NOTIFY."""
 
-    def __init__(self, connection, audit_table):
+    def __init__(self, pool, audit_table, key=1):
 
-        super().__init__(connection)
+        super().__init__()
+
+        self.pool = pool
         self.audit_table = audit_table
+        self.key = key
 
     def on_notify(self):
         """Echo back entry that triggered the notify"""
 
         SQL = sql.SQL("SELECT * FROM {};").format(sql.Identifier(self.audit_table))
-        last_entry = self.connection.select_rows(SQL, fetch_method=0)
+        last_entry = self.pool.select_rows(SQL, fetch_method=0, key=self.key)
         logger.debug(f"(Last entry in table: {last_entry})")
 
         return 1
@@ -33,10 +36,14 @@ if __name__ == "__main__":
     # Initialize database connection, which we will use to handle transactions with the NOTIFY results
     database = Database(Config())
 
-    with database.connect() as database_connection:
+    # Create a connection pool. Context manager ensures pool is closed at the end.
+    with database.open(minconns=1) as pool:
 
-        # Create your custom handler: must have a .on_notify(Database) method implemented.
-        handler = LastEntryFetcher(database_connection, audit_table='data_container_last')
-        dumbo = Listener(database_connection, 'table_changed', handler)
+        # Get individual connections from the pool. Context manager ensures connection [key] is returned to the pool.
+        with pool.connect(key=1):
 
-        dumbo.run()
+            # Create your custom handler: must have a .on_notify(Database) method implemented.
+            handler = LastEntryFetcher(pool, audit_table='data_container_last', key=1)
+            dumbo = Listener(pool, 'table_changed', handler, key=1)
+
+            dumbo.run()

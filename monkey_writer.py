@@ -11,8 +11,9 @@ if __name__ == "__main__":
             with open('data/fake_data.txt', "a") as f:
 
                 # Write current timestamp
-                f.write(str(time.time()) + '\n')
-                logger.debug("Wrote number to file")
+                number = time.time()
+                f.write(str(number) + '\n')
+                logger.debug(f"Wrote number {number} to file")
 
             # Wait a variable amount of time before writing next
             time.sleep(np.random.randint(10))
